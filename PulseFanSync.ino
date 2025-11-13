@@ -1,6 +1,6 @@
 // ==== Version & GitHub-Konfiguration ========================================
 
-#define FW_CURRENT_VERSION "1.0.0"  // aktuelle Firmware-Version auf dem Gerät
+#define FW_CURRENT_VERSION "1.0.2"  // aktuelle Firmware-Version auf dem Gerät
 
 // URL zu deiner latest.json in GitHub (raw content)
 const char* GITHUB_LATEST_URL =
@@ -183,34 +183,40 @@ bool performHttpFirmwareUpdate(const String& url) {
   Serial.println("FW-Update von: " + url);
 
   WiFiClientSecure client;
-  client.setInsecure();  // für GitHub ohne Zertifikatsprüfung
+  client.setInsecure();  // GitHub TLS ohne Zertifikatsprüfung
 
   HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // wichtig für GitHub-Redirects
+
+  Serial.println("[HTTP] begin...");
   if (!http.begin(client, url)) {
-    Serial.println("http.begin fehlgeschlagen");
+    Serial.println("[HTTP] http.begin() fehlgeschlagen");
     return false;
   }
 
+  Serial.println("[HTTP] GET...");
   int httpCode = http.GET();
+  Serial.printf("[HTTP] GET Code: %d\n", httpCode);
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("HTTP Fehler: %d\n", httpCode);
+    Serial.printf("[HTTP] Fehler, Code=%d\n", httpCode);
     http.end();
     return false;
   }
 
   int contentLength = http.getSize();
-  if (contentLength <= 0) {
-    Serial.println("Keine gültige Content-Length");
-    http.end();
-    return false;
+  bool hasContentLength = contentLength > 0;
+
+  if (hasContentLength) {
+    Serial.printf("Content-Length: %d Bytes\n", contentLength);
+  } else {
+    Serial.println("Keine Content-Length (chunked oder unbekannt).");
   }
 
   WiFiClient *stream = http.getStreamPtr();
 
-  Serial.printf("Gesamtgröße: %d Bytes\n", contentLength);
-
-  if (!Update.begin(contentLength)) {
-    Serial.println("Update.begin fehlgeschlagen");
+  // Wenn keine Content-Length bekannt ist, UPDATE_SIZE_UNKNOWN verwenden
+  if (!Update.begin(hasContentLength ? contentLength : (int)UPDATE_SIZE_UNKNOWN)) {
+    Serial.printf("Update.begin() fehlgeschlagen, Error=%d\n", Update.getError());
     http.end();
     return false;
   }
@@ -221,49 +227,64 @@ bool performHttpFirmwareUpdate(const String& url) {
   size_t totalRead = 0;
   int lastPercent = -1;
 
-  Serial.print("Fortschritt: 0%");
+  Serial.println("Starte Download & Flash...");
+  if (hasContentLength) {
+    Serial.print("Fortschritt: 0%");
+  } else {
+    Serial.print("Fortschritt (Bytes): 0");
+  }
 
-  while (http.connected() && (totalRead < (size_t)contentLength)) {
+  while (http.connected()) {
+    // wenn nichts da ist, kurz warten
+    if (!stream->available()) {
+      if (!http.connected()) break;
+      delay(1);
+      continue;
+    }
+
     size_t avail = stream->available();
-    if (avail) {
-      size_t toRead = avail;
-      if (toRead > BUF_SIZE) toRead = BUF_SIZE;
-      // sicherstellen, dass wir nicht über contentLength hinauslesen
-      if (totalRead + toRead > (size_t)contentLength) {
-        toRead = contentLength - totalRead;
-      }
+    size_t toRead = avail;
+    if (toRead > BUF_SIZE) toRead = BUF_SIZE;
 
-      int c = stream->readBytes(buff, toRead);
-      if (c <= 0) {
-        Serial.println("\nLesefehler aus dem Stream");
-        break;
-      }
+    int c = stream->readBytes(buff, toRead);
+    if (c <= 0) {
+      Serial.println("\nLesefehler aus dem Stream");
+      break;
+    }
 
-      // in Flash schreiben
-      if (Update.write(buff, c) != (size_t)c) {
-        Serial.printf("\nUpdate.write Fehler: %d\n", Update.getError());
-        http.end();
-        return false;
-      }
+    if (Update.write(buff, c) != (size_t)c) {
+      Serial.printf("\nUpdate.write Fehler: %d\n", Update.getError());
+      http.end();
+      return false;
+    }
 
-      totalRead += c;
+    totalRead += c;
 
+    if (hasContentLength) {
       int percent = (int)((totalRead * 100) / contentLength);
       if (percent != lastPercent) {
-        // einfache Loader-Variante:
         Serial.print("\rFortschritt: ");
         Serial.print(percent);
         Serial.print("%");
         lastPercent = percent;
       }
+    } else {
+      // Fallback: nur Byte-Zähler ausgeben
+      if (totalRead % (16 * 1024) < BUF_SIZE) { // ungefähr alle 16KB
+        Serial.print("\rFortschritt (Bytes): ");
+        Serial.print(totalRead);
+      }
     }
 
-    delay(1); // Watchdog freundlich stimmen
+    // Abbruch, falls der Server nichts mehr liefert
+    if (hasContentLength && totalRead >= (size_t)contentLength) {
+      break;
+    }
   }
 
   Serial.println();
 
-  if (totalRead != (size_t)contentLength) {
+  if (hasContentLength && totalRead != (size_t)contentLength) {
     Serial.printf("Nur %u von %d Bytes gelesen\n", (unsigned)totalRead, contentLength);
     http.end();
     return false;
@@ -285,8 +306,9 @@ bool performHttpFirmwareUpdate(const String& url) {
   Serial.println("Update erfolgreich – Neustart...");
   delay(500);
   ESP.restart();
-  return true;  // wird praktisch nie erreicht
+  return true;  // praktisch nie erreicht
 }
+
 
 
 // Holt latest.json von GitHub, vergleicht Version, optional Auto-Install
