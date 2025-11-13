@@ -183,7 +183,7 @@ bool performHttpFirmwareUpdate(const String& url) {
   Serial.println("FW-Update von: " + url);
 
   WiFiClientSecure client;
-  client.setInsecure();  // keine Zertifikatsprüfung (für Start ok)
+  client.setInsecure();  // für GitHub ohne Zertifikatsprüfung
 
   HTTPClient http;
   if (!http.begin(client, url)) {
@@ -207,15 +207,64 @@ bool performHttpFirmwareUpdate(const String& url) {
 
   WiFiClient *stream = http.getStreamPtr();
 
+  Serial.printf("Gesamtgröße: %d Bytes\n", contentLength);
+
   if (!Update.begin(contentLength)) {
     Serial.println("Update.begin fehlgeschlagen");
     http.end();
     return false;
   }
 
-  size_t written = Update.writeStream(*stream);
-  if (written != (size_t)contentLength) {
-    Serial.printf("Nur %u von %d Bytes geschrieben\n", (unsigned)written, contentLength);
+  const size_t BUF_SIZE = 2048;
+  uint8_t buff[BUF_SIZE];
+
+  size_t totalRead = 0;
+  int lastPercent = -1;
+
+  Serial.print("Fortschritt: 0%");
+
+  while (http.connected() && (totalRead < (size_t)contentLength)) {
+    size_t avail = stream->available();
+    if (avail) {
+      size_t toRead = avail;
+      if (toRead > BUF_SIZE) toRead = BUF_SIZE;
+      // sicherstellen, dass wir nicht über contentLength hinauslesen
+      if (totalRead + toRead > (size_t)contentLength) {
+        toRead = contentLength - totalRead;
+      }
+
+      int c = stream->readBytes(buff, toRead);
+      if (c <= 0) {
+        Serial.println("\nLesefehler aus dem Stream");
+        break;
+      }
+
+      // in Flash schreiben
+      if (Update.write(buff, c) != (size_t)c) {
+        Serial.printf("\nUpdate.write Fehler: %d\n", Update.getError());
+        http.end();
+        return false;
+      }
+
+      totalRead += c;
+
+      int percent = (int)((totalRead * 100) / contentLength);
+      if (percent != lastPercent) {
+        // einfache Loader-Variante:
+        Serial.print("\rFortschritt: ");
+        Serial.print(percent);
+        Serial.print("%");
+        lastPercent = percent;
+      }
+    }
+
+    delay(1); // Watchdog freundlich stimmen
+  }
+
+  Serial.println();
+
+  if (totalRead != (size_t)contentLength) {
+    Serial.printf("Nur %u von %d Bytes gelesen\n", (unsigned)totalRead, contentLength);
     http.end();
     return false;
   }
@@ -236,8 +285,9 @@ bool performHttpFirmwareUpdate(const String& url) {
   Serial.println("Update erfolgreich – Neustart...");
   delay(500);
   ESP.restart();
-  return true;  // wird praktisch nicht mehr erreicht
+  return true;  // wird praktisch nie erreicht
 }
+
 
 // Holt latest.json von GitHub, vergleicht Version, optional Auto-Install
 bool checkGithubForUpdate(bool autoInstall) {
