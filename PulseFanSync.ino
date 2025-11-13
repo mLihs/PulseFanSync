@@ -4,7 +4,7 @@
 
 // URL zu deiner latest.json in GitHub (raw content)
 const char* GITHUB_LATEST_URL =
-  "https://raw.githubusercontent.com/DEINUSER/DEINREPO/main/firmware/latest.json";
+  "https://raw.githubusercontent.com/mLihs/PulseFanSync/8d5ef836f280a88765517639daa970aee6e02183/lastest";
 
 // ==== Includes ==============================================================
 #include <WiFi.h>
